@@ -1,0 +1,4 @@
+#!/bin/sh
+# Harbor launcher (Mac/Linux). Runs the Vanta-based engine.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$DIR/vanta.py" "$DIR/harbor.va" "$@"

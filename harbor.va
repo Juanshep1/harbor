@@ -1,0 +1,374 @@
+# ===========================================================================
+# Harbor - a container engine, written entirely in Vanta.
+#
+# Harbor works like Docker but in a portable way that runs the same on
+# Mac, Windows, and Linux:
+#
+#   - An IMAGE is a saved bundle of files plus a recipe (the "Harborfile").
+#   - A CONTAINER is an isolated sandbox folder created from an image, in
+#     which the image's start command runs.
+#
+# Run it with the 'harbor' launcher, e.g.:
+#   ./harbor build harbor-examples/hello
+#   ./harbor images
+#   ./harbor run hello
+#   ./harbor ps
+# ===========================================================================
+
+
+# --------------------------------------------------------------------------
+# Where Harbor keeps its data (like ~/.docker). Works cross-platform.
+# --------------------------------------------------------------------------
+to harbor_home()
+    let home be env("HOME")
+    if home is ""
+        change home to env("USERPROFILE")
+    end
+    give back home + "/.harbor"
+end
+
+to images_dir()
+    give back harbor_home() + "/images"
+end
+
+to containers_dir()
+    give back harbor_home() + "/containers"
+end
+
+to ensure_dirs()
+    make_dir(harbor_home())
+    make_dir(images_dir())
+    make_dir(containers_dir())
+end
+
+
+# --------------------------------------------------------------------------
+# The Harborfile language (also Vanta). A Harborfile calls these functions
+# to describe an image:  name(...), base(...), include(...), start(...)
+# --------------------------------------------------------------------------
+let build_config be {}
+
+to reset_config()
+    change build_config to { "name": "", "base": "none", "start": "", "files": [], "ports": [], "env": {} }
+end
+
+to name(value)
+    change build_config at "name" to value
+end
+
+to base(value)
+    change build_config at "base" to value
+end
+
+to start(value)
+    change build_config at "start" to value
+end
+
+to include(value)
+    add value to build_config["files"]
+end
+
+to expose(port)
+    add port to build_config["ports"]
+end
+
+to setenv(key, value)
+    # build_config["env"] is the same map object, so changing it here
+    # updates the config.
+    let environment be build_config["env"]
+    change environment at key to value
+end
+
+
+# --------------------------------------------------------------------------
+# harbor build <project-dir>
+# --------------------------------------------------------------------------
+to cmd_build(project_dir)
+    ensure_dirs()
+    reset_config()
+
+    let recipe be project_dir + "/Harborfile"
+    if not path_exists(recipe)
+        say "No Harborfile found in " + project_dir
+        give back nothing
+    end
+
+    # Running the Harborfile fills in build_config via the functions above.
+    import recipe
+
+    let image_name be build_config["name"]
+    if image_name is ""
+        say "Your Harborfile must set a name, like:  name(myapp)"
+        give back nothing
+    end
+
+    let image_path be images_dir() + "/" + image_name
+    remove_path(image_path)
+    make_dir(image_path)
+    make_dir(image_path + "/files")
+
+    # Copy every included file into the image.
+    for each file in build_config["files"]
+        copy_path(project_dir + "/" + file, image_path + "/files/" + file)
+    end
+
+    # If this image is based on Vanta, bundle the interpreter so the
+    # container is self-contained and can run Vanta programs anywhere.
+    if build_config["base"] is "vanta"
+        copy_path(interpreter(), image_path + "/files/vanta.py")
+    end
+
+    write_file(image_path + "/manifest.json", to_json(build_config))
+    say "Built image '" + image_name + "' (" + length(build_config["files"]) + " file(s))"
+end
+
+
+# --------------------------------------------------------------------------
+# harbor images
+# --------------------------------------------------------------------------
+to cmd_images()
+    ensure_dirs()
+    let names be list_dir(images_dir())
+    if length(names) is 0
+        say "No images yet. Build one with:  harbor build <dir>"
+        give back nothing
+    end
+    say "IMAGE                START COMMAND"
+    for each image_name in names
+        let manifest be from_json(read_file(images_dir() + "/" + image_name + "/manifest.json"))
+        say pad(image_name, 20) + manifest["start"]
+    end
+end
+
+
+# --------------------------------------------------------------------------
+# harbor run <image>
+# --------------------------------------------------------------------------
+to cmd_run(image_name)
+    ensure_dirs()
+    let image_path be images_dir() + "/" + image_name
+    if not path_exists(image_path)
+        say "No such image: " + image_name
+        give back nothing
+    end
+
+    let manifest be from_json(read_file(image_path + "/manifest.json"))
+
+    # Create a fresh, isolated sandbox for this container.
+    let container_id be "harbor_" + text(random(100000, 999999))
+    let container_path be containers_dir() + "/" + container_id
+    make_dir(container_path)
+    copy_path(image_path + "/files", container_path + "/root")
+
+    # Older images may not have env/ports; default them.
+    let container_env be {}
+    if contains(manifest, "env")
+        change container_env to manifest["env"]
+    end
+    if contains(manifest, "ports") and length(manifest["ports"]) is over 0
+        say "Declared ports: " + to_json(manifest["ports"]) + "  (recorded, not network-mapped)"
+    end
+
+    say "Running container " + container_id + " from image '" + image_name + "'"
+    say "----------------------------------------"
+
+    # Run the start command INSIDE the sandbox folder, with its environment.
+    let result be shell(manifest["start"], container_path + "/root", container_env)
+    say result["output"]
+
+    say "----------------------------------------"
+    say "Container " + container_id + " exited with code " + result["code"]
+
+    # Save the logs and metadata so 'ps' and 'logs' can see them later.
+    write_file(container_path + "/logs.txt", result["output"])
+    let meta be { "id": container_id, "image": image_name, "code": result["code"], "start": manifest["start"] }
+    write_file(container_path + "/meta.json", to_json(meta))
+end
+
+
+# --------------------------------------------------------------------------
+# harbor ps
+# --------------------------------------------------------------------------
+to cmd_ps()
+    ensure_dirs()
+    let ids be list_dir(containers_dir())
+    if length(ids) is 0
+        say "No containers have run yet."
+        give back nothing
+    end
+    say "CONTAINER ID         IMAGE           EXIT"
+    for each container_id in ids
+        let meta be from_json(read_file(containers_dir() + "/" + container_id + "/meta.json"))
+        say pad(meta["id"], 21) + pad(meta["image"], 16) + meta["code"]
+    end
+end
+
+
+# --------------------------------------------------------------------------
+# harbor logs <container-id>
+# --------------------------------------------------------------------------
+to cmd_logs(container_id)
+    let log_path be containers_dir() + "/" + container_id + "/logs.txt"
+    if not path_exists(log_path)
+        say "No such container: " + container_id
+        give back nothing
+    end
+    say read_file(log_path)
+end
+
+
+# --------------------------------------------------------------------------
+# harbor rm <id>   and   harbor rmi <image>
+# --------------------------------------------------------------------------
+to cmd_rm(container_id)
+    remove_path(containers_dir() + "/" + container_id)
+    say "Removed container " + container_id
+end
+
+to cmd_rmi(image_name)
+    remove_path(images_dir() + "/" + image_name)
+    say "Removed image " + image_name
+end
+
+
+# --------------------------------------------------------------------------
+# A simple local registry: push/pull images to a shared folder, the way you
+# would push to Docker Hub. Here the "hub" is just ~/.harbor/registry.
+# --------------------------------------------------------------------------
+to registry_dir()
+    give back harbor_home() + "/registry"
+end
+
+to cmd_push(image_name)
+    ensure_dirs()
+    let source be images_dir() + "/" + image_name
+    if not path_exists(source)
+        say "No such image: " + image_name
+        give back nothing
+    end
+    make_dir(registry_dir())
+    remove_path(registry_dir() + "/" + image_name)
+    copy_path(source, registry_dir() + "/" + image_name)
+    say "Pushed '" + image_name + "' to the local registry"
+end
+
+to cmd_pull(image_name)
+    ensure_dirs()
+    let source be registry_dir() + "/" + image_name
+    if not path_exists(source)
+        say "'" + image_name + "' is not in the registry. Push it first."
+        give back nothing
+    end
+    remove_path(images_dir() + "/" + image_name)
+    copy_path(source, images_dir() + "/" + image_name)
+    say "Pulled '" + image_name + "' from the local registry"
+end
+
+
+# --------------------------------------------------------------------------
+# harbor inspect <image>  - show what's inside an image.
+# --------------------------------------------------------------------------
+to cmd_inspect(image_name)
+    let manifest_path be images_dir() + "/" + image_name + "/manifest.json"
+    if not path_exists(manifest_path)
+        say "No such image: " + image_name
+        give back nothing
+    end
+    let manifest be from_json(read_file(manifest_path))
+    say "Image:  " + manifest["name"]
+    say "Base:   " + manifest["base"]
+    say "Start:  " + manifest["start"]
+    say "Files:  " + to_json(manifest["files"])
+    if contains(manifest, "ports")
+        say "Ports:  " + to_json(manifest["ports"])
+    end
+    if contains(manifest, "env")
+        say "Env:    " + to_json(manifest["env"])
+    end
+end
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+to pad(textvalue, width)
+    let result be textvalue
+    while length(result) is under width
+        change result to result + " "
+    end
+    give back result
+end
+
+to usage()
+    say "Harbor - a container engine written in Vanta"
+    say ""
+    say "Usage:"
+    say "  harbor build <dir>     build an image from a Harborfile"
+    say "  harbor images          list all images"
+    say "  harbor inspect <image> show an image's details"
+    say "  harbor run <image>     run a new container from an image"
+    say "  harbor ps              list containers that have run"
+    say "  harbor logs <id>       show a container's output"
+    say "  harbor push <image>    push an image to the local registry"
+    say "  harbor pull <image>    pull an image from the local registry"
+    say "  harbor rm <id>         remove a container"
+    say "  harbor rmi <image>     remove an image"
+end
+
+to needs_arg(args)
+    if length(args) is under 2
+        say "That command needs an argument. See 'harbor' for usage."
+        give back no
+    end
+    give back yes
+end
+
+
+# --------------------------------------------------------------------------
+# Main: read the command line and dispatch.
+# --------------------------------------------------------------------------
+let args be arguments()
+
+if length(args) is 0
+    usage()
+otherwise if args[0] is "build"
+    if needs_arg(args)
+        cmd_build(args[1])
+    end
+otherwise if args[0] is "images"
+    cmd_images()
+otherwise if args[0] is "inspect"
+    if needs_arg(args)
+        cmd_inspect(args[1])
+    end
+otherwise if args[0] is "run"
+    if needs_arg(args)
+        cmd_run(args[1])
+    end
+otherwise if args[0] is "ps"
+    cmd_ps()
+otherwise if args[0] is "logs"
+    if needs_arg(args)
+        cmd_logs(args[1])
+    end
+otherwise if args[0] is "push"
+    if needs_arg(args)
+        cmd_push(args[1])
+    end
+otherwise if args[0] is "pull"
+    if needs_arg(args)
+        cmd_pull(args[1])
+    end
+otherwise if args[0] is "rm"
+    if needs_arg(args)
+        cmd_rm(args[1])
+    end
+otherwise if args[0] is "rmi"
+    if needs_arg(args)
+        cmd_rmi(args[1])
+    end
+otherwise
+    say "Unknown command: " + args[0]
+    say ""
+    usage()
+end
