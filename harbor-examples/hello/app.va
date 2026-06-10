@@ -1,0 +1,11 @@
+# This is the workload - a Vanta program that runs INSIDE the container.
+
+say "Hello from inside a Harbor container!"
+say "I am a Vanta program running in my own isolated sandbox."
+say "My WHO environment variable is: " + env("WHO")
+
+let total be 0
+for each n in range(1, 6)
+    change total to total + n
+end
+say "Proof I ran real code: 1+2+3+4+5 = " + total

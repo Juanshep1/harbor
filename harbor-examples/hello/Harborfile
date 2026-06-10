@@ -1,0 +1,8 @@
+# A Harborfile is a container recipe, written in Vanta.
+
+name("hello")
+base("vanta")
+include("app.va")
+setenv("WHO", "Vanta")
+expose(8080)
+start("python3 vanta.py app.va")

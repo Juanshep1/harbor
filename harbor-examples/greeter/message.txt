@@ -1,0 +1,1 @@
+Greetings from a Harbor container! (This one runs a plain shell command, no Vanta needed.)

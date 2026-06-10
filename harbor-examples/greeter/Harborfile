@@ -1,0 +1,7 @@
+# Harbor can run ANY workload, not just Vanta. This container just
+# runs a plain shell command. base("none") means no Vanta runtime is bundled.
+
+name("greeter")
+base("none")
+include("message.txt")
+start("cat message.txt")
